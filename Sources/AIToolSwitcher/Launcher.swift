@@ -128,8 +128,19 @@ final class WindowActivator {
         activateApplication(tool)
     }
 
+    func candidateIdentifiers(for tool: AITool) -> [String] {
+        let identifiers = tool.bundleIdentifiers
+        guard identifiers.count > 1, let preferred = identifiers.first else {
+            return identifiers
+        }
+        let preferredAvailable = NSWorkspace.shared.urlForApplication(withBundleIdentifier: preferred) != nil
+            || !NSRunningApplication.runningApplications(withBundleIdentifier: preferred).isEmpty
+        return ActivationRouting.candidates(identifiers, preferredAvailable: preferredAvailable)
+    }
+
     private func activateApplication(_ tool: AITool) {
-        let runningApplications = tool.bundleIdentifiers.flatMap {
+        let identifiers = candidateIdentifiers(for: tool)
+        let runningApplications = identifiers.flatMap {
             NSRunningApplication.runningApplications(withBundleIdentifier: $0)
         }
 
@@ -145,9 +156,9 @@ final class WindowActivator {
             return
         }
 
-        guard let url = tool.firstMatchingApplication(
-            using: NSWorkspace.shared.urlForApplication(withBundleIdentifier:)
-        ) else { return }
+        guard let url = identifiers.lazy.compactMap({
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+        }).first else { return }
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -176,8 +187,8 @@ final class WindowActivator {
             AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue)
             let title = (titleValue as? String) ?? ""
 
-            if keywords.contains(where: { title.localizedCaseInsensitiveContains($0) }) {
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            if keywords.contains(where: { title.localizedCaseInsensitiveContains($0) }),
+               AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success {
                 return true
             }
         }
@@ -302,6 +313,8 @@ final class ToolButton: NSButton {
 final class LauncherPanel: NSPanel {
     private static let orientationKey = "AIToolSwitcher.isVertical"
     private static let statusKeyPrefix = "AIToolSwitcher.status."
+    private static let hiddenToolsKey = "AIToolSwitcher.hiddenTools"
+    private static let positionKey = "AIToolSwitcher.panelTopLeft"
     private static let orientationButtonWidth: CGFloat = 44
     private static let buttonHeight: CGFloat = 42
     private static let toolButtonWidth: CGFloat = 46
@@ -309,6 +322,9 @@ final class LauncherPanel: NSPanel {
     private let activator = WindowActivator()
     private let tools: [AITool]
     private var isVertical: Bool
+    private(set) var toolVisibility: ToolVisibility
+    private var savedAnchor: CGPoint?
+    private var isApplyingLayout = false
     private let visualEffectView = NSVisualEffectView()
     private let stackView = NSStackView()
     private let orientationButton = NSButton()
@@ -317,6 +333,13 @@ final class LauncherPanel: NSPanel {
     init(tools: [AITool]) {
         self.tools = tools
         self.isVertical = UserDefaults.standard.bool(forKey: Self.orientationKey)
+        self.toolVisibility = ToolVisibility(
+            catalog: tools.map(\.title),
+            savedHidden: UserDefaults.standard.stringArray(forKey: Self.hiddenToolsKey) ?? []
+        )
+        if let position = UserDefaults.standard.string(forKey: Self.positionKey) {
+            self.savedAnchor = NSPointFromString(position)
+        }
         let initialSize = Self.panelSize(for: tools, isVertical: isVertical)
         super.init(
             contentRect: NSRect(origin: .zero, size: initialSize),
@@ -333,7 +356,6 @@ final class LauncherPanel: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         isMovableByWindowBackground = true
-        setFrameAutosaveName("AIToolSwitcherPanel")
 
         visualEffectView.material = .hudWindow
         visualEffectView.blendingMode = .behindWindow
@@ -344,6 +366,7 @@ final class LauncherPanel: NSPanel {
         visualEffectView.translatesAutoresizingMaskIntoConstraints = false
 
         stackView.spacing = 8
+        stackView.detachesHiddenViews = true
         stackView.translatesAutoresizingMaskIntoConstraints = false
 
         for (index, tool) in tools.enumerated() {
@@ -394,11 +417,52 @@ final class LauncherPanel: NSPanel {
             ])
         }
 
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(panelMoved(_:)), name: NSWindow.didMoveNotification, object: self
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+
+        applyToolVisibility()
         updateRunningStates()
-        updateLayout(animated: false)
+        updateLayout()
     }
 
     override var canBecomeKey: Bool { true }
+
+    func toggleToolVisibility(_ title: String) {
+        guard toolVisibility.toggle(title) else { return }
+        UserDefaults.standard.set(toolVisibility.hidden.sorted(), forKey: Self.hiddenToolsKey)
+        applyToolVisibility()
+        updateLayout()
+    }
+
+    func resetPosition() {
+        savedAnchor = nil
+        UserDefaults.standard.removeObject(forKey: Self.positionKey)
+        updateLayout()
+    }
+
+    private func applyToolVisibility() {
+        for (title, button) in toolButtons {
+            button.isHidden = toolVisibility.hidden.contains(title)
+        }
+    }
+
+    @objc private func panelMoved(_ notification: Notification) {
+        guard !isApplyingLayout else { return }
+        let anchor = CGPoint(x: frame.minX, y: frame.maxY)
+        savedAnchor = anchor
+        UserDefaults.standard.set(NSStringFromPoint(anchor), forKey: Self.positionKey)
+    }
+
+    @objc private func screenParametersChanged(_ notification: Notification) {
+        updateLayout()
+    }
 
     private func makeButton(for tool: AITool, tag: Int) -> ToolButton {
         let button = ToolButton(title: "", target: self, action: #selector(toolButtonClicked(_:)))
@@ -513,9 +577,9 @@ final class LauncherPanel: NSPanel {
     }
 
     private func isApplicationRunning(for tool: AITool) -> Bool {
-        tool.firstMatchingApplication {
-            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
-        } != nil
+        activator.candidateIdentifiers(for: tool).contains {
+            !NSRunningApplication.runningApplications(withBundleIdentifier: $0).isEmpty
+        }
     }
 
     private static func panelSize(for tools: [AITool], isVertical: Bool) -> NSSize {
@@ -561,10 +625,10 @@ final class LauncherPanel: NSPanel {
     @objc private func orientationButtonClicked() {
         isVertical.toggle()
         UserDefaults.standard.set(isVertical, forKey: Self.orientationKey)
-        updateLayout(animated: true)
+        updateLayout()
     }
 
-    private func updateLayout(animated: Bool) {
+    private func updateLayout() {
         stackView.orientation = isVertical ? .vertical : .horizontal
         stackView.alignment = isVertical ? .centerX : .centerY
         let orientationDescription = isVertical ? "横型にする" : "縦型にする"
@@ -576,32 +640,103 @@ final class LauncherPanel: NSPanel {
         orientationButton.toolTip = orientationDescription
         orientationButton.setAccessibilityLabel(orientationDescription)
 
-        guard let screen = NSScreen.main else { return }
-        let visibleFrame = screen.visibleFrame
-        let size = Self.panelSize(for: tools, isVertical: isVertical)
-        let newFrame = NSRect(
-            x: visibleFrame.midX - size.width / 2,
-            y: visibleFrame.maxY - size.height - 12,
-            width: size.width,
-            height: size.height
-        )
-
-        if animated {
-            animator().setFrame(newFrame, display: true)
-        } else {
-            setFrame(newFrame, display: true)
+        let anchorScreen = savedAnchor.flatMap { anchor in
+            NSScreen.screens.first {
+                $0.frame.contains(CGPoint(x: anchor.x, y: anchor.y - 1))
+            }
         }
+        guard let targetScreen = anchorScreen ?? NSScreen.main else { return }
+        let visibleTools = tools.filter { !toolVisibility.hidden.contains($0.title) }
+        let size = Self.panelSize(for: visibleTools, isVertical: isVertical)
+        let newFrame = PanelPlacement.frame(
+            size: size, anchor: anchorScreen == nil ? nil : savedAnchor, in: targetScreen.visibleFrame
+        )
+        isApplyingLayout = true
+        defer { isApplyingLayout = false }
+        setFrame(newFrame, display: true)
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panel: LauncherPanel?
+    private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         panel = LauncherPanel(tools: AIToolCatalog.tools)
         panel?.orderFrontRegardless()
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(
+            systemSymbolName: "square.grid.2x2",
+            accessibilityDescription: "AI Tool Switcher"
+        )
+        item.button?.toolTip = "AI Tool Switcher"
+        let menu = NSMenu()
+        menu.delegate = self
+        menuNeedsUpdate(menu)
+        item.menu = menu
+        statusItem = item
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        panel?.orderFrontRegardless()
+        return true
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let panel else { return }
+        menu.removeAllItems()
+        menu.autoenablesItems = false
+        let visibilityTitle = panel.isVisible ? "パネルを隠す" : "パネルを再表示"
+        menu.addItem(menuItem(visibilityTitle, action: #selector(togglePanel)))
+        menu.addItem(menuItem("位置を戻す", action: #selector(resetPanelPosition)))
+        menu.addItem(.separator())
+
+        let toolsItem = NSMenuItem(title: "表示するAIツール", action: nil, keyEquivalent: "")
+        let toolsMenu = NSMenu()
+        toolsMenu.autoenablesItems = false
+        for tool in AIToolCatalog.tools {
+            let item = menuItem(tool.title, action: #selector(toggleTool(_:)))
+            item.representedObject = tool.title
+            item.state = panel.toolVisibility.hidden.contains(tool.title) ? .off : .on
+            item.isEnabled = panel.toolVisibility.canToggle(tool.title)
+            toolsMenu.addItem(item)
+        }
+        toolsItem.submenu = toolsMenu
+        menu.addItem(toolsItem)
+        menu.addItem(.separator())
+        menu.addItem(menuItem("AI Tool Switcherを終了", action: #selector(quit)))
+    }
+
+    private func menuItem(_ title: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc private func togglePanel() {
+        guard let panel else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    @objc private func resetPanelPosition() {
+        panel?.resetPosition()
+        panel?.orderFrontRegardless()
+    }
+
+    @objc private func toggleTool(_ sender: NSMenuItem) {
+        guard let title = sender.representedObject as? String else { return }
+        panel?.toggleToolVisibility(title)
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
