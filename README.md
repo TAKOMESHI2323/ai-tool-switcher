@@ -40,3 +40,7 @@ open "build/AI Tool Switcher.app"
 ウインドウ名を見て対象のウインドウを前面に出すには、「システム設定」→「プライバシーとセキュリティ」→「アクセシビリティ」で **AI Tool Switcher** を許可してください。許可しない場合は、アプリ単位で前面化を試みます。Codexボタンはデスクトップアプリに加え、Terminalなども切り替え先の候補にします。
 
 各アプリの名称は切り替え先を示すもので、AI Tool SwitcherはHoshiLaboが開発しています。
+
+## ライセンス
+
+[MIT License](LICENSE)
