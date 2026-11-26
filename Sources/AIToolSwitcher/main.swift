@@ -8,6 +8,15 @@ struct AITool {
     let bundleIdentifiers: [String]
     let windowKeywords: [String]
     let behavior: ActivationBehavior
+
+    func firstMatchingApplication<Result>(using lookup: (String) -> Result?) -> Result? {
+        for bundleIdentifier in bundleIdentifiers {
+            if let match = lookup(bundleIdentifier) {
+                return match
+            }
+        }
+        return nil
+    }
 }
 
 enum ActivationBehavior {
@@ -136,16 +145,13 @@ final class WindowActivator {
             return
         }
 
-        for bundleIdentifier in tool.bundleIdentifiers {
-            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
-                continue
-            }
+        guard let url = tool.firstMatchingApplication(
+            using: NSWorkspace.shared.urlForApplication(withBundleIdentifier:)
+        ) else { return }
 
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-            return
-        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration)
     }
 
     private func raiseMatchingWindow(in application: NSRunningApplication, keywords: [String]) -> Bool {
@@ -418,12 +424,9 @@ final class LauncherPanel: NSPanel {
     }
 
     private func applicationIcon(for tool: AITool) -> NSImage? {
-        guard let bundleIdentifier = tool.bundleIdentifiers.first,
-              let applicationURL = NSWorkspace.shared.urlForApplication(
-                  withBundleIdentifier: bundleIdentifier
-              ) else {
-            return nil
-        }
+        guard let applicationURL = tool.firstMatchingApplication(
+            using: NSWorkspace.shared.urlForApplication(withBundleIdentifier:)
+        ) else { return nil }
 
         let icon = NSWorkspace.shared.icon(forFile: applicationURL.path)
         icon.size = NSSize(width: 28, height: 28)
@@ -510,12 +513,9 @@ final class LauncherPanel: NSPanel {
     }
 
     private func isApplicationRunning(for tool: AITool) -> Bool {
-        guard let primaryBundleIdentifier = tool.bundleIdentifiers.first else {
-            return false
-        }
-        return !NSRunningApplication.runningApplications(
-            withBundleIdentifier: primaryBundleIdentifier
-        ).isEmpty
+        tool.firstMatchingApplication {
+            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
+        } != nil
     }
 
     private static func panelSize(for tools: [AITool], isVertical: Bool) -> NSSize {
